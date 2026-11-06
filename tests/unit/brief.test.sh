@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cb-brief.sh 的行为测试：四段都在、顺序固定、缺一段必须说出来而不是静默省略。
+# cb-brief.sh 的行为测试：五段都在、顺序固定、缺一段必须说出来而不是静默省略。
 set -uo pipefail
 . "$(dirname "$0")/../helper.sh"
 setup
@@ -7,6 +7,33 @@ B="$ROOT/scripts/cb-brief.sh"
 export NO_COLOR=1
 export XDG_CACHE_HOME="$TESTDIR/cache"
 export COINBASE_PORTFOLIO_ID="11111111-1111-1111-1111-111111111111"
+
+# 市场板块也必须使用夹具，否则正常路径会依赖五个真实 HTTP 接口。
+export CB_MARKET_FIXTURE_DIR="$TESTDIR/market"
+mkdir -p "$CB_MARKET_FIXTURE_DIR"
+python3 - "$CB_MARKET_FIXTURE_DIR" <<'PY'
+import json, pathlib, sys
+fixtures = {
+    "fng": {"data": [{"value": "30", "value_classification": "Fear"}]},
+    "global": {"data": {"total_market_cap": {"usd": 2.41e12},
+                         "market_cap_percentage": {"btc": 58.3}}},
+    "stablecoins": {"peggedAssets": [{"circulating": {"peggedUSD": 1.2e11}}]},
+    "okx_funding": {"data": [{"fundingRate": "0.0001"}]},
+    "mempool": {"fastestFee": 1},
+}
+for name, data in fixtures.items():
+    (pathlib.Path(sys.argv[1]) / (name + ".json")).write_text(json.dumps(data))
+PY
+
+# 夹具遗漏时立即失败，并在结尾断言没有尝试联网。
+export HTTP_LOG="$TESTDIR/http.log"
+: > "$HTTP_LOG"
+cat > "$STUB_DIR/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$HTTP_LOG"
+exit 97
+STUB
+chmod +x "$STUB_DIR/curl"
 
 FIX="$TESTDIR/feeds"; mkdir -p "$FIX"
 python3 - "$FIX" <<'PY'
@@ -23,11 +50,13 @@ PY
 
 run() { CB_NEWS_FIXTURE_DIR="$FIX" bash "$B" "$@" 2>&1; }
 
-# ---------- 四段齐全 + 顺序 ----------
+# ---------- 五段齐全 + 顺序 ----------
 out=$(run --news 2 --candles 3); rc=$?
 assert_exit "$rc" 0 "正常运行时退出码 0"
 assert_contains "$out" "态势简报" "有标题"
 assert_contains "$out" "=== 风控 ===" "有风控段"
+assert_contains "$out" "=== 市场 ===" "有市场段"
+assert_contains "$out" "30（Fear）" "市场段使用离线夹具"
 assert_contains "$out" "=== 余额 ===" "有余额段"
 assert_contains "$out" "=== 走势 ===" "有走势段"
 assert_contains "$out" "=== 事件 ===" "有事件段"
@@ -65,6 +94,14 @@ out=$(run --candles 0 --news 2)
 assert_contains "$out" "（跳过）" "--candles 0：走势段跳过"
 
 # ---------- 板块失败必须说出来 ----------
+EMPTY_MARKET="$TESTDIR/empty-market"; mkdir -p "$EMPTY_MARKET"
+out=$(CB_MARKET_FIXTURE_DIR="$EMPTY_MARKET" run --news 0 --candles 0); rc=$?
+assert_exit "$rc" 1 "市场全失败：整份简报退出码 1"
+assert_contains "$out" "所有市场数据源都失败了" "市场全失败：说清原因"
+out=$(CB_MARKET_FIXTURE_DIR="$EMPTY_MARKET" run --no-market --news 0 --candles 0); rc=$?
+assert_exit "$rc" 0 "--no-market：不因市场源不可用而失败"
+assert_not_contains "$out" "所有市场数据源都失败了" "--no-market：不读取市场源"
+
 BAD="$TESTDIR/bad"; mkdir -p "$BAD"
 printf 'not xml at all <<<' > "$BAD/sec_press.xml"
 out=$(CB_NEWS_FIXTURE_DIR="$BAD" bash "$B" --news 2 --candles 0 2>&1); rc=$?
@@ -87,6 +124,8 @@ bash "$B" --news abc >/dev/null 2>&1; assert_exit "$?" 2 "--news 非数字 → 2
 bash "$B" --candles -1 >/dev/null 2>&1; assert_exit "$?" 2 "--candles 负数 → 2"
 out=$(bash "$B" --help 2>&1)
 assert_contains "$out" "cb-brief.sh" "--help：打印用法"
+
+assert_eq "$(cat "$HTTP_LOG")" "" "全部简报测试均未尝试 HTTP 请求"
 
 teardown
 finish
